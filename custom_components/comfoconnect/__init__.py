@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -189,7 +190,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ComfoConnectConfigEntry)
     # Older models may not support this diagnostic, in which case the saved
     # setup choice or the pre-existing m³/h default remains the fallback.
     try:
-        await bridge.register_sensor(SENSORS[SENSOR_UNIT_AIRFLOW])
+        await bridge.async_register_sensor_once(SENSORS[SENSOR_UNIT_AIRFLOW])
     except AioComfoConnectError as err:
         _LOGGER.info("The ventilation unit did not expose its airflow unit: %s", err)
     except BaseException:
@@ -265,6 +266,8 @@ class ComfoConnectBridge(ComfoConnect):
         self.add_node_devices = False
         self.is_available = True
         self.reported_airflow_unit: str | None = None
+        self._sensor_registrations: dict[int, asyncio.Task[None]] = {}
+        self._latest_sensor_values: dict[int, object] = {}
 
     @property
     def airflow_unit(self) -> str:
@@ -354,12 +357,25 @@ class ComfoConnectBridge(ComfoConnect):
         if self.is_available == available:
             return
         self.is_available = available
+        if not available:
+            self._latest_sensor_values.clear()
         _LOGGER.info("Bridge %s availability changed: %s", self.uuid, available)
         async_dispatcher_send(self.hass, SIGNAL_COMFOCONNECT_AVAILABILITY.format(self.uuid), available)
 
+    async def async_register_sensor_once(self, sensor: Sensor) -> None:
+        """Share one subscription and replay a valid cached reading to new listeners."""
+        registration = self._sensor_registrations.get(sensor.id)
+        if registration is None or registration.done() and (registration.cancelled() or registration.exception() is not None):
+            registration = self.hass.async_create_task(self.register_sensor(sensor))
+            self._sensor_registrations[sensor.id] = registration
+        await registration
+        if sensor.id in self._latest_sensor_values:
+            self.sensor_callback(sensor, self._latest_sensor_values[sensor.id])
+
     @callback
     def sensor_callback(self, sensor: Sensor, value):
-        """Notify listeners that we have received an update."""
+        """Cache sensor readings, detect airflow units, and notify listeners."""
+        self._latest_sensor_values[sensor.id] = value
         if sensor.id == SENSOR_UNIT_AIRFLOW and value in AIRFLOW_UNITS:
             self.reported_airflow_unit = value
         async_dispatcher_send(
